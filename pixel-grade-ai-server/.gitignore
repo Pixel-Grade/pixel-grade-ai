@@ -1,0 +1,22 @@
+node_modules/
+dist/
+coverage/
+logs/
+.vercel
+*.log
+
+# env files with real credentials — only the example/sample/local templates are safe to commit
+.env
+.env.*
+!.env.example
+
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+*.zip
+
+# EB packaging staging dir (scripts/make-server-zip.mjs)
+.ebstage/
+
+# EB log dumps (scripts/eb-logs.mjs)
+eb-logs/

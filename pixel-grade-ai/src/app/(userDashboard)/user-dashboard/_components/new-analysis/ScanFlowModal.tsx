@@ -1,0 +1,560 @@
+"use client";
+
+import {
+  useCancelAnalysisMutation,
+  useConfirmCardMutation,
+  useCreateAnalysisMutation,
+  type TAnalysis,
+  type TCardCandidate,
+  type TUploadSource,
+} from "@/redux/features/analysis/analysisApi";
+import { useAddCollectionItemMutation } from "@/redux/features/collection/collectionApi";
+import {
+  useGradeAnalysisMutation,
+  type TGradingReport,
+} from "@/redux/features/grading/gradingApi";
+import { analysisApi } from "@/redux/features/analysis/analysisApi";
+import { useUploadFilesMutation } from "@/redux/features/user/userApi";
+import type { CardGame } from "@/types/card";
+import { useAppDispatch } from "@/redux/hooks";
+import { App, ConfigProvider, Modal, Spin } from "antd";
+import Image from "next/image";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { FiCheck } from "react-icons/fi";
+
+// ---------------------------------------------------------------------------
+// The scan pipeline in one dialog:
+//
+//   upload files → POST /analysis (identify, 10 credits) → user CONFIRMS the
+//   match (hard gate — grading refuses to run without it) → POST /grading →
+//   report.
+//
+// The 10 credits buy a finished report. Everything that ends the scan without
+// one gives them back: identification and grading failures refund server-side,
+// and closing the dialog at the confirmation step cancels the scan (which also
+// refunds). The server sweeps anything still unconfirmed after its timeout, so
+// a closed tab is covered too — the cancel call here is the fast path.
+// ---------------------------------------------------------------------------
+
+type Step =
+  | { name: "uploading" }
+  | { name: "identifying" }
+  | { name: "confirm"; analysis: TAnalysis; candidates: TCardCandidate[] }
+  | { name: "grading" }
+  | { name: "result"; report: TGradingReport }
+  | { name: "error"; message: string };
+
+interface ScanFlowModalProps {
+  open: boolean;
+  source: TUploadSource;
+  game?: CardGame;
+  language?: string;
+  front: File[];
+  back: File[];
+  onClose: () => void;
+}
+
+/** Pull the backend envelope's message out of an RTK error, if there is one. */
+const errorMessage = (err: unknown, fallback: string): string => {
+  try {
+    if (typeof err === "string") return err;
+    if (typeof err !== "object" || err === null) return fallback;
+
+    // RTK FetchBaseQueryError shape: { data: { message } }
+    if ("data" in err) {
+      const data = (err as Record<string, unknown>).data;
+      if (typeof data === "object" && data !== null && "message" in data) {
+        const msg = (data as Record<string, unknown>).message;
+        if (typeof msg === "string" && msg.length > 0) return msg;
+      }
+      // Sometimes data itself is a string (plain-text error body)
+      if (typeof data === "string" && data.length > 0) return data;
+    }
+
+    // RTK SerializedError shape: { message }
+    if ("message" in err) {
+      const msg = (err as Record<string, unknown>).message;
+      if (typeof msg === "string" && msg.length > 0) return msg;
+    }
+
+    // Fallback: { error } (e.g., fetch network failure)
+    if ("error" in err) {
+      const nested = (err as Record<string, unknown>).error;
+      if (typeof nested === "string" && nested.length > 0) return nested;
+    }
+  } catch {
+    // Never let the error-message extractor itself crash.
+  }
+  return fallback;
+};
+
+/**
+ * Idempotency key for one scan attempt.
+ *
+ * `crypto.randomUUID` is restricted to secure contexts, and a staging box on
+ * plain HTTP does not qualify — falling back beats throwing on the one call
+ * that protects the user from being charged twice.
+ */
+const newRequestId = (): string =>
+  typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+
+/** The card behind a report — populated by the server on the grade response. */
+const reportCard = (report: TGradingReport) =>
+  typeof report.card === "object" ? report.card : null;
+
+export default function ScanFlowModal({
+  open,
+  source,
+  game,
+  language,
+  front,
+  back,
+  onClose,
+}: ScanFlowModalProps) {
+  const router = useRouter();
+  const { message: toast } = App.useApp();
+  const dispatch = useAppDispatch();
+
+  const [step, setStep] = useState<Step>({ name: "uploading" });
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+
+  const [uploadFiles] = useUploadFilesMutation();
+  const [createAnalysis] = useCreateAnalysisMutation();
+  const [confirmCard, { isLoading: isConfirming }] = useConfirmCardMutation();
+  const [gradeAnalysis] = useGradeAnalysisMutation();
+  const [cancelAnalysis] = useCancelAnalysisMutation();
+  const [addToCollection, { isLoading: isAddingToCollection }] =
+    useAddCollectionItemMutation();
+
+  const [addedToCollection, setAddedToCollection] = useState(false);
+
+  // Invalidates an in-flight run so a late response cannot resurrect a dialog
+  // the user already closed.
+  const runId = useRef(0);
+
+  /**
+   * Whether this opening of the dialog has already started a scan.
+   *
+   * This is a spending guard, not a cosmetic one. Starting the pipeline debits
+   * 10 credits, so it must happen once per opening rather than once per effect
+   * invocation — and React StrictMode invokes mount effects twice in
+   * development, which previously ran the scan, and charged for it, twice.
+   */
+  const started = useRef(false);
+
+  /**
+   * The scan that would be abandoned if the dialog closed right now.
+   *
+   * Set once identification succeeds, cleared the moment a report exists —
+   * after that the credits were earned and there is nothing to give back.
+   */
+  const abandonable = useRef<string | null>(null);
+
+  const runPipeline = useCallback(async () => {
+    const id = ++runId.current;
+    const stillCurrent = () => runId.current === id;
+
+    try {
+      setStep({ name: "uploading" });
+
+      // The upload endpoint takes at most 10 files per request, which is
+      // exactly one side's maximum — so upload per side.
+      const uploadSide = async (files: File[]) => {
+        if (files.length === 0) return [];
+        const form = new FormData();
+        files.forEach((file) => form.append("files", file));
+        const result = await uploadFiles(form).unwrap();
+        return Array.isArray(result) ? result : [result];
+      };
+
+      const [frontUploaded, backUploaded] = await Promise.all([
+        uploadSide(front),
+        uploadSide(back),
+      ]);
+      if (!stillCurrent()) return;
+
+      setStep({ name: "identifying" });
+
+      const analysis = await createAnalysis({
+        // Belt to the `started` ref's braces: if this request is retried below
+        // the app — a proxy, a flaky connection — the server resolves the key
+        // to the scan it already ran instead of charging for another.
+        clientRequestId: newRequestId(),
+        source,
+        game,
+        language,
+        images: [
+          ...frontUploaded.map((file, i) => ({
+            imageUrl: file.url,
+            side: "front" as const,
+            slotIndex: i,
+          })),
+          ...backUploaded.map((file, i) => ({
+            imageUrl: file.url,
+            side: "back" as const,
+            slotIndex: i,
+          })),
+        ],
+      }).unwrap();
+      if (!stillCurrent()) return;
+
+      // From here the scan is paid for but has produced nothing, so closing the
+      // dialog has to hand the credits back.
+      abandonable.current = analysis._id;
+
+      // Candidates live on GET /analysis/:id (cards populated).
+      const detail = await dispatch(
+        analysisApi.endpoints.getAnalysis.initiate(analysis._id, {
+          forceRefetch: true,
+        }),
+      ).unwrap();
+      if (!stillCurrent()) return;
+
+      setSelectedCardId(detail.candidates[0]?.card._id ?? null);
+      setStep({
+        name: "confirm",
+        analysis: detail.analysis,
+        candidates: detail.candidates,
+      });
+    } catch (err) {
+      if (!stillCurrent()) return;
+      setStep({
+        name: "error",
+        message: errorMessage(
+          err,
+          "The scan failed. Your credits were refunded — try again.",
+        ),
+      });
+    }
+  }, [
+    back,
+    createAnalysis,
+    dispatch,
+    front,
+    game,
+    language,
+    source,
+    uploadFiles,
+  ]);
+
+  useEffect(() => {
+    if (!open) {
+      // Closing invalidates whatever is in flight and re-arms the guard, so the
+      // next opening is free to start its own scan.
+      runId.current += 1;
+      started.current = false;
+      return;
+    }
+    if (started.current) return;
+    started.current = true;
+    setAddedToCollection(false);
+    void runPipeline();
+  }, [open, runPipeline]);
+
+  /**
+   * Close, refunding the scan if it never became a report.
+   *
+   * Fire-and-forget on purpose: the server sweeps unconfirmed scans on a timer
+   * regardless, so a cancel that fails to send costs the user a wait, never the
+   * credits — and blocking the dialog on it would be worse.
+   */
+  const closeDialog = useCallback(() => {
+    const abandoned = abandonable.current;
+    abandonable.current = null;
+    if (abandoned) {
+      void cancelAnalysis(abandoned)
+        .unwrap()
+        .catch(() => {
+          // Swept server-side. Nothing useful to say to a user who is leaving.
+        });
+    }
+    onClose();
+  }, [cancelAnalysis, onClose]);
+
+  const confirmAndGrade = async () => {
+    if (step.name !== "confirm" || !selectedCardId || isConfirming) return;
+    const analysisId = step.analysis._id;
+
+    try {
+      await confirmCard({ analysisId, cardId: selectedCardId }).unwrap();
+      setStep({ name: "grading" });
+      const report = await gradeAnalysis(analysisId).unwrap();
+      abandonable.current = null;
+      onClose();
+      router.push(`/user-dashboard/analysis-report?reportId=${report._id}`);
+    } catch (err) {
+      // Grading failures refund server-side, and a confirmed scan is past the
+      // point the cancel endpoint will refund, so drop the handle rather than
+      // firing a cancel that could only double-count.
+      abandonable.current = null;
+      setStep({
+        name: "error",
+        message: errorMessage(err, "Grading failed. Try again."),
+      });
+    }
+  };
+
+  const handleAddToCollection = async () => {
+    if (step.name !== "result" || isAddingToCollection) return;
+    try {
+      await addToCollection({ report: step.report._id }).unwrap();
+      setAddedToCollection(true);
+      toast.success("Added to your collection.");
+    } catch (err) {
+      toast.error(errorMessage(err, "Couldn't add the card. Try again."));
+    }
+  };
+
+  const busy =
+    step.name === "uploading" ||
+    step.name === "identifying" ||
+    step.name === "grading";
+
+  const busyLabel =
+    step.name === "uploading"
+      ? "Uploading images…"
+      : step.name === "identifying"
+        ? "Identifying your card…"
+        : "Grading your card — this can take a moment…";
+
+  return (
+    <ConfigProvider theme={{ components: { Modal: { contentBg: "#18181b" } } }}>
+      <Modal
+        open={open}
+        onCancel={busy ? undefined : closeDialog}
+        footer={null}
+        centered
+        width={560}
+        maskClosable={false}
+        closable={!busy}
+        keyboard={!busy}
+      >
+        {busy && (
+          <div className="flex flex-col items-center gap-4 py-14">
+            <Spin size="large" />
+            <p className="text-sm text-zinc-300">{busyLabel}</p>
+          </div>
+        )}
+
+        {step.name === "confirm" && (
+          <div className="py-2">
+            <h2 className="text-lg font-semibold text-white">
+              Confirm your card
+            </h2>
+            <p className="mt-1 text-xs text-zinc-400">
+              Pick the card these images actually show — grading can&apos;t
+              start until you confirm. Cancel and your 10 credits come back.
+            </p>
+            {step.analysis.detectedExternalGrade && (
+              <p className="mt-2 rounded-lg bg-amber-500/10 px-3 py-2 text-[11px] text-amber-400">
+                Detected an existing slab grade:{" "}
+                {step.analysis.detectedExternalGrade}
+              </p>
+            )}
+
+            <ul className="mt-5 max-h-80 space-y-2 overflow-y-auto pr-1">
+              {step.candidates.map((candidate) => {
+                const selected = selectedCardId === candidate.card._id;
+                return (
+                  <li key={candidate._id}>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedCardId(candidate.card._id)}
+                      className={`flex w-full items-center gap-3 rounded-xl border p-3 text-left transition-colors ${
+                        selected
+                          ? "border-violet-500 bg-violet-500/10"
+                          : "border-white/10 hover:border-white/30"
+                      }`}
+                    >
+                      {candidate.card.officialImageUrl ? (
+                        <Image
+                          src={candidate.card.officialImageUrl}
+                          alt=""
+                          width={40}
+                          height={56}
+                          // Card art comes from external CDNs (Scrydex/pokemontcg
+                          // in mock) — skip optimization so an unconfigured host
+                          // doesn't throw in render.
+                          unoptimized
+                          className="h-14 w-10 shrink-0 rounded-md object-cover"
+                        />
+                      ) : (
+                        <span className="h-14 w-10 shrink-0 rounded-md bg-white/10" />
+                      )}
+
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm text-white">
+                          {candidate.card.name}
+                        </span>
+                        <span className="block truncate text-[11px] text-zinc-400">
+                          {[
+                            candidate.card.setExpansion,
+                            candidate.card.cardNumber,
+                            candidate.card.rarity,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </span>
+                        {candidate.rank === 0 && (
+                          <span className="mt-1 inline-block rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+                            Best match
+                          </span>
+                        )}
+                      </span>
+
+                      {selected && (
+                        <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-violet-500 text-white">
+                          <FiCheck size={12} />
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={closeDialog}
+                className="rounded-full border border-white/20 px-5 py-2.5 text-sm text-white transition-colors hover:border-white/50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmAndGrade}
+                disabled={!selectedCardId || isConfirming}
+                className="rounded-full bg-violet-600 px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isConfirming ? "Confirming…" : "Confirm & grade"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step.name === "result" && (
+          <div className="py-2 text-center">
+            {/* The card this grade belongs to. Without it the panel showed only
+                a grade band ("EX"), which reads as if it were the card's own
+                name — the same identity the slab label and the report PDF
+                carry, so the three now agree. */}
+            {(() => {
+              const card = reportCard(step.report);
+              const meta = [
+                card?.cardNumber,
+                card?.setExpansion,
+                card?.language,
+              ]
+                .filter(Boolean)
+                .join(" · ");
+              return (
+                <>
+                  <h2 className="text-lg font-semibold text-white">
+                    {card?.name ?? "Your card"}
+                  </h2>
+                  {meta && <p className="mt-1 text-xs text-zinc-400">{meta}</p>}
+                </>
+              );
+            })()}
+
+            <p className="mt-6 text-xs tracking-wide text-zinc-400 uppercase">
+              AI grade
+            </p>
+            <p className="mt-2 text-5xl font-semibold text-violet-400 tabular-nums">
+              {step.report.grade}
+            </p>
+            <p className="mt-1 text-sm font-medium text-white">
+              {step.report.gradeLabel}
+              {step.report.pixelVerified && (
+                <span className="ml-2 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+                  Pixel Verified
+                </span>
+              )}
+            </p>
+
+            <dl className="mx-auto mt-6 grid max-w-sm grid-cols-2 gap-2">
+              {[
+                { label: "Surfaces", value: step.report.scoreSurface },
+                { label: "Corners", value: step.report.scoreCorners },
+                { label: "Edges", value: step.report.scoreEdges },
+                { label: "Centering", value: step.report.scoreCentering },
+              ].map((score) => (
+                <div
+                  key={score.label}
+                  className="rounded-xl border border-violet-500/40 px-3 py-2.5"
+                >
+                  <dt className="text-[11px] text-zinc-400">{score.label}</dt>
+                  <dd className="mt-0.5 text-lg font-medium text-white tabular-nums">
+                    {score.value}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+
+            {step.report.reasoning && (
+              <p className="mx-auto mt-4 max-w-md text-left text-xs leading-relaxed text-zinc-400">
+                {step.report.reasoning}
+              </p>
+            )}
+
+            <div className="mt-7 flex justify-center gap-3">
+              <button
+                onClick={handleAddToCollection}
+                disabled={isAddingToCollection || addedToCollection}
+                className="rounded-full border border-violet-500/60 px-5 py-2.5 text-sm text-violet-300 transition-colors hover:bg-violet-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {addedToCollection
+                  ? "In your collection ✓"
+                  : "Add to collection"}
+              </button>
+              <button
+                onClick={closeDialog}
+                className="rounded-full bg-violet-600 px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-violet-700"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step.name === "error" && (
+          <div className="py-8 text-center">
+            {/* Error icon */}
+            <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-red-500/10">
+              <svg
+                className="h-7 w-7 text-red-400"
+                fill="none"
+                viewBox="0 0 24 24"
+                strokeWidth={1.5}
+                stroke="currentColor"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z"
+                />
+              </svg>
+            </div>
+            <h3 className="mb-2 text-lg font-semibold text-white">
+              Grading Unsuccessful
+            </h3>
+            <p className="mx-auto max-w-xs text-sm leading-relaxed text-zinc-400">
+              {step.message}
+            </p>
+            <p className="mt-2 text-xs text-zinc-500">
+              Your credits have been refunded automatically.
+            </p>
+            <button
+              onClick={closeDialog}
+              className="mt-6 rounded-full border border-white/20 bg-white/5 px-8 py-2.5 text-sm font-medium text-white transition-all hover:border-white/40 hover:bg-white/10"
+            >
+              Close
+            </button>
+          </div>
+        )}
+      </Modal>
+    </ConfigProvider>
+  );
+}
